@@ -1,0 +1,15 @@
+**/*.lps
+**/*.compiled
+**/*.[oa]
+**/*.ppu
+**/*.rst
+**/*.cgi
+**/*.dbg
+**/*.exe
+**/*.log
+**/*.bak*
+**/*.dll
+__history
+lib
+backup
+bin
