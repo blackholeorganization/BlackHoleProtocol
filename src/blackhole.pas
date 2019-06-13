@@ -25,13 +25,14 @@ type
     bekInvalidInputPrivateKey, bekInvalidResponse, bekMultiPublicKeys,
     bekInvalidSignature,
     bekInvalidAddress, bekInvalidUserName, bekInvalidPrivateKey,
-    bekNoConnection, bekCanNotMakeStorageFile);
+    bekNoConnection, bekCanNotMakeStorageFile, bekUnavailableShortenerProvider);
   TBHErrorKinds = set of TBHErrorKind;
   TBHManagerOption = (bmoLocalStorage, bmoTestHub, bmoNoEncryption,
     bmoNoFileCompression);
   TBHManagerOptions = set of TBHManagerOption;
   TBHManager = class;
   TBHProvider = class;
+  TBHLinkShortener = class;
 
   { BHException }
 
@@ -75,6 +76,7 @@ type
     FFileName: TFileName;
     FKey: TBHKey;
     FPassword: RawUTF8;
+    FShortURL: RawUTF8;
     FState: TBHShareState;
     FURL: RawUTF8;
     function GetURL: RawUTF8;
@@ -84,6 +86,7 @@ type
     procedure SetPassword(AValue: RawUTF8);
   public
     property URL: RawUTF8 read GetURL;
+    property ShortURL: RawUTF8 read FShortURL;
   published
     property FileName: TFileName read FFileName write SetFileName;
     property Key: TBHKey read FKey write SetKey;
@@ -96,6 +99,7 @@ type
 
   TBHShareRequest = class(TSynAutoCreateFields)
   private
+    FEnableShortLinkGeneration: boolean;
     FFinishTime: TDateTime;
     function CancelPart: boolean;
     function GetProgress: single;
@@ -112,6 +116,9 @@ type
     FPrepareProgress: single;
     FPrepareWeight: single;
     LastFileSyncTime: QWord;
+    Terminated: boolean;
+    ShortPK: IECPrivateKeyParameters;
+    ShortPass: RawUTF8;
     procedure SyncUpdateStatus;
     procedure UpdateStatus;
     function Check(AError: TBHErrorKind): boolean; overload;
@@ -121,6 +128,7 @@ type
     function UploadFile: TBHErrorKind;
     function UploadHistory: TBHErrorKind;
     procedure UploadPart(AIndex: PtrInt; AData: Pointer; AItem: TMultiThreadProcItem);
+    function GenerateShortLink: TBHErrorKind;
     function IsCompressible(const AFileName: TFileName): boolean;
   protected
     function CheckSize: TBHErrorKind; virtual;
@@ -128,6 +136,7 @@ type
     procedure InternalRun; virtual;
   public
     constructor Create(AManager: TBHManager; AFileName: TFileName); virtual; overload;
+    destructor Destroy; override;
     procedure Run;
     property UploadProgress: single read GetUploadProgress;
     property Progress: single read GetProgress;
@@ -139,6 +148,7 @@ type
     property PrepareProgress: single read FPrepareProgress;
     property PrepareWeight: single read FPrepareWeight;
     property FinishTime: TDateTime read FFinishTime;
+    property EnableShortLinkGeneration: boolean read FEnableShortLinkGeneration write FEnableShortLinkGeneration;
   end;
 
   TBHCancelFunction = function: boolean of object;
@@ -197,6 +207,7 @@ type
   TBHManager = class
   private
     FDeviceID: TBHDeviceID;
+    FLinkShortener: TBHLinkShortener;
     FOnSignInRequest: TBHManagerSignInRequestEvent;
     FOnStatusChange: TNotifyEvent;
     FOptions: TBHManagerOptions;
@@ -217,6 +228,7 @@ type
     function SaveInfo: boolean;
     function ClearInfo: boolean;
     function MakeProvider(ARandom: boolean): TBHProvider;
+    function MakeGaiaProvider(AHost: RawUTF8; APrivateKey: IECPrivateKeyParameters): TBHGaiaProvider;
     procedure DoUpload(ARequest: TBHShareRequest);
     procedure UpdateUpload(ARequest: TBHShareRequest);
     function BlockStackErrorToBHError(AValue: TBlockStackErrorKind): TBHErrorKind;
@@ -240,6 +252,7 @@ type
     property Auth: TBlockStack read FAuth;
     property Prepared: boolean read FPrepared;
     property Provider: TBHProvider read FProvider;
+    property LinkShortener: TBHLinkShortener read FLinkShortener;
     property DeviceID: TBHDeviceID read FDeviceID;
     property InfoStorageName: TFileName read GetInfoStorageName;
     property IsStorageValid: boolean read GetIsStorageValid;
@@ -261,6 +274,21 @@ type
     property DeviceID: RawUTF8 read FDeviceID write FDeviceID;
   end;
 
+  { TBHLinkShortener }
+
+  TBHLinkShortener = class
+  private
+    FProvider: TBHProvider;
+    FManager: TBHManager;
+    function GetPrivateKey: IECPrivateKeyParameters;
+  public
+    constructor Create(AManager: TBHManager);
+    destructor Destroy; override;
+    function Prepare: TBHErrorKind;
+    function GenerateLink(AURL: RawByteString; APrivateKey: IECPrivateKeyParameters; APass: RawUTF8): string;
+  public
+  end;
+
 const
   BH_VERSION = 5;
   BH_DEFAULT_TRY_COUNT = 180;
@@ -272,6 +300,7 @@ const
   BH_SIGNIN_REDIRECT_URL = 'https://blackhole.run/redirect';
   BH_MANIFEST_URL = 'https://blackhole.run/manifest.json';
   BH_SHARE_URL = 'https://app.blackhole.run/#';
+  BH_LINK_SHORTENER_GAIA_HUB_URL = 'https://hub.blockstack.org';
 
 var
   BHTestGaiaURL: string;
@@ -280,6 +309,54 @@ var
 implementation
 
 uses  Math;
+
+{ TBHLinkShortener }
+
+function TBHLinkShortener.GetPrivateKey: IECPrivateKeyParameters;
+begin
+  Result := TBHGaiaProvider(FProvider).Hub.PrivateKey;
+end;
+
+constructor TBHLinkShortener.Create(AManager: TBHManager);
+begin
+  FManager := AManager;
+end;
+
+destructor TBHLinkShortener.Destroy;
+begin
+  if (FProvider <> nil) then
+    FProvider.Free;
+  inherited Destroy;
+end;
+
+function TBHLinkShortener.Prepare: TBHErrorKind;
+begin
+  Result := bekNone;
+  FProvider := FManager.MakeGaiaProvider(BH_LINK_SHORTENER_GAIA_HUB_URL, TCrypto.GeneratePrivateKey);
+  if FProvider is TBHGaiaProvider then
+    if not TBHGaiaProvider(FProvider).Hub.Prepare then
+    begin
+      Result := bekUnavailableShortenerProvider;
+      FreeAndNil(FProvider);
+    end;
+end;
+
+function TBHLinkShortener.GenerateLink(AURL: RawByteString; APrivateKey: IECPrivateKeyParameters; APass: RawUTF8): string;
+var
+  EncBuf: RawByteString;
+begin
+  Result := '';
+  with TBHGaiaProvider(FProvider).Hub do
+  begin
+    PrivateKey := APrivateKey;
+    if (Prepare) then
+    begin
+      EncBuf := TCrypto.EncryptPKCS7(APass, Address, 60000, AURL, True);
+      if (FProvider.SetData('url', EncBuf, BH_DEFAULT_TRY_COUNT) = bekNone) then
+        Result := APass + Address;
+    end;
+  end;
+end;
 
 { TBHGaiaProvider }
 
@@ -393,6 +470,8 @@ end;
 
 procedure TBHShareRequest.UpdateStatus;
 begin
+  if Terminated then
+    Exit;
   if Share.State in [bssStoped, bssFinished] then
     FFinishTime := Now;
   TThread.Synchronize(TThread.CurrentThread, @SyncUpdateStatus);
@@ -400,6 +479,8 @@ end;
 
 function TBHShareRequest.Check(AError: TBHErrorKind): boolean;
 begin
+  if Terminated then
+    Exit(True);
   Share.Error := AError;
   Result := Self.Check;
   if Result then
@@ -408,15 +489,15 @@ end;
 
 function TBHShareRequest.Check: boolean;
 begin
-  try
-    Result := Share.State = bssStoped;
-  except
-    Result := False;
-  end;
+  if Terminated then
+    Exit(True);
+  Result := Share.State = bssStoped;
 end;
 
 procedure TBHShareRequest.SetState(AValue: TBHShareState);
 begin
+  if Terminated then
+    Exit;
   if Share.State = AValue then
     Exit;
   Share.State := AValue;
@@ -425,6 +506,10 @@ end;
 
 procedure TBHShareRequest.SetError(AValue: TBHErrorKind);
 begin
+  if Terminated then
+    Exit;
+  if Share.Error = AValue then
+    Exit;
   Share.Error := AValue;
 end;
 
@@ -445,14 +530,18 @@ function TBHShareRequest.UploadHistory: TBHErrorKind;
 var
   Buf, EncBuf: RawByteString;
   FN: string;
-  PK: RawUTF8;
+  PK, SHPK: RawUTF8;
 begin
   if Provider is TBHGaiaProvider then
     PK := TCrypto.PrivateKeyAsString(TBHGaiaProvider(Provider).Hub.PrivateKey)
   else
     PK := '';
+  if (ShortPK <> nil) then
+    SHPK := TCrypto.PrivateKeyAsString(ShortPK)
+  else
+    SHPK := '';
   with Share do
-    Buf := JSONEncode(['BHV', BH_VERSION, 'PK', PK, 'FN', FileName, 'KY', Key]);
+    Buf := JSONEncode(['BHV', BH_VERSION, 'PK', PK, 'FN', FileName, 'KY', Key, 'SHPK', SHPK, 'SHPA', ShortPass]);
   FN := Manager.DeviceID + '_' + IntToString(UnixTimeUTC);
   if Manager.Encrypt(Buf, EncBuf) then
     Result := Manager.Provider.SetData(FN, EncBuf, BH_DEFAULT_TRY_COUNT)
@@ -486,6 +575,8 @@ begin
   E := Provider.SetData(PH, EncBuf, BH_DEFAULT_TRY_COUNT, @CancelPart);
   if E <> bekNone then
     raise BHException.Create(E);
+  if Check then
+    Exit;
   FFile.FParts[AIndex] := PH;
   if Check then
     Exit;
@@ -507,6 +598,14 @@ begin
     finally
       FileSyncSafe.UnLock;
     end;
+end;
+
+function TBHShareRequest.GenerateShortLink: TBHErrorKind;
+begin
+  Result := bekNone;
+  ShortPK := TCrypto.GeneratePrivateKey;
+  ShortPass := TCrypto.RandomURLSafePassword(10);
+  Share.FShortURL := Manager.LinkShortener.GenerateLink(Share.URL, ShortPK, ShortPass);
 end;
 
 function TBHShareRequest.IsCompressible(const AFileName: TFileName): boolean;
@@ -561,7 +660,7 @@ begin
   Result := bekNone;
   if not FileExists(FileName) then
     Exit(bekFileNotFound);
-  Size := FileSize(FileName);
+  Size := FileUtil.FileSize(FileName);
   if Size > BH_DATA_SIZE_LIMIT then
     Exit(bekExceedSizeLimit);
   if Size <= 0 then
@@ -586,7 +685,6 @@ begin
 
   if Compressible then
   begin
-    FFile.Recipe := ['zip'];
     ChunkSize := Max(Str.Size div 100, 2 * 1024 * 1024);
     ChunkCount := Str.Size div ChunkSize;
     if ChunkCount * ChunkSize < Str.Size then
@@ -594,7 +692,7 @@ begin
 
     TempFileName := TemporaryFileName;
     Stream := TFileStream.Create(TempFileName, fmCreate);
-    with TSynZipCompressor.Create(Stream, 6, szcfZip) do
+    with TSynZipCompressor.Create(Stream, 6, szcfRaw) do
       try
         for i := 0 to ChunkCount - 1 do
         begin
@@ -609,7 +707,10 @@ begin
       end;
 
     if Stream.Size < Size then
-      Str.Free
+    begin
+      Str.Free;
+      FFile.Recipe := ['deflateRaw'];
+    end
     else
     begin
       Stream.Free;
@@ -630,7 +731,7 @@ var
 begin
   SetState(bssInitializing);
   if Provider is TBHGaiaProvider then
-    if not TBHGaiaProvider(Provider).Hub.UpdateHubInfo then
+    if not TBHGaiaProvider(Provider).Hub.Prepare then
     begin
       Check(bekInvalidProvider);
       Exit;
@@ -656,6 +757,9 @@ begin
   SetLength(FFile.FParts, PartCount);
   if Check(UploadFile) then
     Exit;
+  if (FEnableShortLinkGeneration) then
+    if (Check(GenerateShortLink)) then
+      Exit;
   SetState(bssRunning);
   try
     UploadPart(0, nil, nil);
@@ -687,6 +791,7 @@ end;
 procedure TBHShareRequest.Run;
 begin
   Provider := Manager.MakeProvider(True);
+  TBHGaiaProvider(Provider).Hub.SetHubInfo(TBHGaiaProvider(Manager.Provider).Hub.UrlPerfix, TBHGaiaProvider(Manager.Provider).Hub.ChallengeText);
   Safe.Init;
   FileSyncSafe.Init;
   try
@@ -703,9 +808,17 @@ end;
 constructor TBHShareRequest.Create(AManager: TBHManager; AFileName: TFileName);
 begin
   inherited Create;
+  Terminated := False;
   Manager := AManager;
   FFileName := AFileName;
   FShareFileName := ExtractFileName(FFileName);
+end;
+
+destructor TBHShareRequest.Destroy;
+begin
+  Terminated := True;
+  inherited Destroy;
+  Self := nil;
 end;
 
 { TBHLocalProvider }
@@ -761,7 +874,6 @@ end;
 function TBHShare.GetURL: RawUTF8;
 var
   Salt: RawUTF8;
-  Enc: TAESCBC;
   EncResult: RawByteString;
 begin
   if Error <> bekNone then
@@ -772,9 +884,7 @@ begin
   if Password <> '' then
   begin
     Salt := TAESPRNG.Main.FillRandomHex(16);
-    Enc := TAESCBC.CreateFromPBKDF2(Password, Salt, 60000);
-    EncResult := Enc.EncryptPKCS7(Result, True);
-    Enc.Free;
+    EncResult := TCrypto.EncryptPKCS7(Password, Salt, 60000, Result, True);
     Result := JSONEncode(['BHV', BH_VERSION, 'SL', Salt, 'CN', BinToBase64uri(EncResult)]);
   end;
   CompressDeflate(Result, True);
@@ -893,8 +1003,13 @@ begin
   FreeAndNil(FProvider);
   FProvider := MakeProvider(False);
   if Provider is TBHGaiaProvider then
-    if not TBHGaiaProvider(FProvider).Hub.UpdateHubInfo then
+    if not TBHGaiaProvider(FProvider).Hub.Prepare then
       Result := bekUnavailableProvider;
+  if Result = bekNone then
+  begin
+    FLinkShortener := TBHLinkShortener.Create(Self);
+    Result := FLinkShortener.Prepare;
+  end;
   if Result = bekNone then
     SetStatus(bhmsReady);
 end;
@@ -985,21 +1100,6 @@ begin
 end;
 
 function TBHManager.MakeProvider(ARandom: boolean): TBHProvider;
-
-  function MakeGaiaProvider(AHost: RawUTF8;
-    APrivateKey: IECPrivateKeyParameters): TBHGaiaProvider;
-  var
-    Hub: TGaiaHub;
-  begin
-    Hub := TGaiaHub.Create;
-    with Hub do
-    begin
-      PrivateKey := APrivateKey;
-      Host := AHost;
-    end;
-    Result := TBHGaiaProvider.Create(Hub, True);
-  end;
-
 begin
   if ARandom then
   begin
@@ -1019,6 +1119,19 @@ begin
     else
       Result := MakeGaiaProvider(Auth.HubURL, Auth.PrivateKey);
   end;
+end;
+
+function TBHManager.MakeGaiaProvider(AHost: RawUTF8; APrivateKey: IECPrivateKeyParameters): TBHGaiaProvider;
+var
+  Hub: TGaiaHub;
+begin
+  Hub := TGaiaHub.Create;
+  with Hub do
+  begin
+    PrivateKey := APrivateKey;
+    Host := AHost;
+  end;
+  Result := TBHGaiaProvider.Create(Hub, True);
 end;
 
 procedure TBHManager.DoUpload(ARequest: TBHShareRequest);
@@ -1122,6 +1235,7 @@ begin
   SetStatus(bhmsNone);
   FAuth.Free;
   FProvider.Free;
+  FLinkShortener.Free;
   inherited Destroy;
 end;
 
@@ -1180,7 +1294,15 @@ begin
   if AShare.Error <> bekNone then
     Exit('');
   if bmoTestHub in FOptions then
-    Result := BHTestShareURL + AShare.URL
+  begin
+    if (AShare.ShortURL <> '') then
+      Result := BHTestShareURL + AShare.ShortURL
+    else
+      Result := BHTestShareURL + AShare.URL;
+  end
+  else
+  if (AShare.ShortURL <> '') then
+    Result := BH_SHARE_URL + AShare.ShortURL
   else
     Result := BH_SHARE_URL + AShare.URL;
 end;
